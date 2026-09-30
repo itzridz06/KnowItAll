@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>KnowItAll – PDF Chatbot (RAG)</title>
+<link href="https://fonts.googleapis.com/css2?family=Bricolage+Grotesque:wght@500;800&family=Source+Serif+4:wght@400;600&display=swap" rel="stylesheet">
+<script src="https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.min.js"></script>
+<style>
+:root{--bg:#f3efe6;--ink:#1b2a41;--mut:#6b7686;--acc:#0b6e69;--card:#fffdf8;--line:#d9d2c0;--hi:#f2c14e}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:17px/1.55 'Source Serif 4',Georgia,serif;height:100vh;display:grid;grid-template-columns:320px 1fr}
+h1,h2,button,.tag{font-family:'Bricolage Grotesque',system-ui,sans-serif}
+aside{background:var(--ink);color:#f3efe6;padding:28px 22px;display:flex;flex-direction:column;gap:18px;overflow:auto}
+h1{margin:0;font-size:34px;font-weight:800;letter-spacing:-1px}
+aside p{margin:0;color:#b9c2d0;font-size:15px}
+.drop{border:2px dashed #5b6c86;border-radius:10px;padding:22px;text-align:center;cursor:pointer;color:#dfe5ee}
+.drop:hover,.drop.on{border-color:var(--hi);color:#fff}
+.docs div{font-size:14px;padding:6px 0;border-bottom:1px solid #2f4262;word-break:break-all}
+input[type=password]{width:100%;padding:9px;border-radius:6px;border:1px solid #5b6c86;background:#12203a;color:#fff}
+small{color:#93a0b5;font-size:12.5px}
+main{display:flex;flex-direction:column;min-width:0;height:100vh}
+#chat{flex:1;overflow:auto;padding:28px min(6vw,60px);display:flex;flex-direction:column;gap:16px}
+.msg{max-width:720px;padding:14px 18px;border-radius:14px;background:var(--card);border:1px solid var(--line);white-space:pre-wrap}
+.me{align-self:flex-end;background:var(--acc);color:#fff;border-color:var(--acc)}
+.src{margin-top:10px;font-size:13.5px;color:var(--mut);border-top:1px solid var(--line);padding-top:8px}
+.tag{background:var(--hi);color:var(--ink);border-radius:4px;padding:1px 7px;font-size:12px;margin-right:6px}
+mark{background:#f2c14e66}
+form{display:flex;gap:10px;padding:16px min(6vw,60px) 24px}
+input[type=text]{flex:1;padding:14px 16px;border-radius:10px;border:1px solid var(--line);font:inherit;background:var(--card)}
+button{background:var(--acc);color:#fff;border:0;border-radius:10px;padding:0 24px;font-size:16px;font-weight:500;cursor:pointer}
+button:disabled{opacity:.5}
+:focus-visible{outline:3px solid var(--hi);outline-offset:2px}
+@media(max-width:800px){body{grid-template-columns:1fr;grid-template-rows:auto 1fr;height:auto}main{height:80vh}}
+</style>
+</head>
+<body>
+<aside>
+  <h1>KnowItAll</h1>
+  <p>Drop in PDFs, then ask questions. Answers come only from your documents, with page references.</p>
+  <label class="drop" id="drop" tabindex="0">Click or drop PDFs here
+    <input id="file" type="file" accept="application/pdf" multiple hidden></label>
+  <div class="docs" id="docs"></div>
+  <div>
+    <input id="key" type="password" placeholder="Gemini API key (optional)" autocomplete="off">
+    <small>With a key, answers are written by Gemini from the retrieved passages. Without it, the best matching passages are shown. Your key stays in this browser.</small>
+  </div>
+</aside>
+<main>
+  <div id="chat"><div class="msg">Upload a PDF to get started.</div></div>
+  <form id="form"><input type="text" id="q" placeholder="Ask something about your PDFs" disabled><button id="go" disabled>Ask</button></form>
+</main>
+<script>
+pdfjsLib.GlobalWorkerOptions.workerSrc='https://cdnjs.cloudflare.com/ajax/libs/pdf.js/3.11.174/pdf.worker.min.js';
+const GEMINI_MODEL='gemini-2.0-flash'; // change if Google renames the model
+const $=id=>document.getElementById(id);
+const STOP=new Set('a an the and or of to in on for is are was were be by with as at it this that from which what who how when where why do does did can i you'.split(' '));
+const tok=t=>t.toLowerCase().match(/[a-z0-9]+/g)?.filter(w=>!STOP.has(w))||[];
+let chunks=[],df={},avg=1;
+
+/* ---------- 1. Ingest: extract text -> chunk -> index ---------- */
+async function ingest(file){
+  const pdf=await pdfjsLib.getDocument({data:await file.arrayBuffer()}).promise;
+  for(let p=1;p<=pdf.numPages;p++){
+    const pg=await pdf.getPage(p);
+    const text=(await pg.getTextContent()).items.map(i=>i.str).join(' ').replace(/\s+/g,' ').trim();
+    const words=text.split(' ');
+    for(let i=0;i<words.length;i+=90){           // 120-word chunks, 30-word overlap
+      const t=words.slice(i,i+120).join(' ');
+      if(t.length>30) chunks.push({doc:file.name,page:p,text:t,tf:count(tok(t)),len:tok(t).length});
+    }
+  }
+  const d=document.createElement('div');d.textContent=file.name+' ('+pdf.numPages+' pages)';$('docs').append(d);
+}
+const count=a=>a.reduce((m,w)=>(m[w]=(m[w]||0)+1,m),{});
+function reindex(){
+  df={};chunks.forEach(c=>Object.keys(c.tf).forEach(w=>df[w]=(df[w]||0)+1));
+  avg=chunks.reduce((s,c)=>s+c.len,0)/Math.max(chunks.length,1)||1;
+}
+/* ---------- 2. Retrieve: BM25 ranking ---------- */
+function retrieve(q,k=4){
+  const qs=tok(q),N=chunks.length;
+  return chunks.map(c=>{
+    let s=0;
+    qs.forEach(w=>{const f=c.tf[w];if(!f)return;
+      const idf=Math.log(1+(N-df[w]+.5)/(df[w]+.5));
+      s+=idf*f*2.2/(f+1.2*(.25+.75*c.len/avg));});
+    return {c,s};
+  }).filter(x=>x.s>0).sort((a,b)=>b.s-a.s).slice(0,k);
+}
+/* ---------- 3. Generate ---------- */
+async function generate(q,hits){
+  const key=$('key').value.trim();
+  if(!key){
+    const qs=new Set(tok(q));
+    return hits.map(h=>{
+      const sents=h.c.text.split(/(?<=[.!?])\s+/);
+      const best=sents.map(s=>({s,n:tok(s).filter(w=>qs.has(w)).length})).sort((a,b)=>b.n-a.n)[0].s;
+      return '• '+best;}).join('\n');
+  }
+  const ctx=hits.map((h,i)=>`[${i+1}] (${h.c.doc}, p.${h.c.page}) ${h.c.text}`).join('\n\n');
+  const prompt=`Answer the question using ONLY the context. If the answer is not in the context, say you could not find it in the documents. Cite sources like [1].\n\nContext:\n${ctx}\n\nQuestion: ${q}`;
+  const r=await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${GEMINI_MODEL}:generateContent?key=${key}`,{
+    method:'POST',headers:{'Content-Type':'application/json'},
+    body:JSON.stringify({contents:[{parts:[{text:prompt}]}]})});
+  const j=await r.json();
+  if(!r.ok) throw new Error(j.error?.message||'Gemini request failed');
+  return j.candidates?.[0]?.content?.parts?.[0]?.text||'No answer returned.';
+}
+/* ---------- UI ---------- */
+const chat=$('chat');
+function add(text,cls,srcHtml){
+  const d=document.createElement('div');d.className='msg '+(cls||'');d.textContent=text;
+  if(srcHtml){const s=document.createElement('div');s.className='src';s.innerHTML=srcHtml;d.append(s);}
+  chat.append(d);chat.scrollTop=chat.scrollHeight;return d;
+}
+const esc=s=>s.replace(/[&<>]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;'}[c]));
+async function load(files){
+  $('drop').firstChild.textContent='Reading PDFs… ';
+  for(const f of files) if(f.type==='application/pdf') await ingest(f);
+  reindex();$('drop').firstChild.textContent='Click or drop PDFs here';
+  $('q').disabled=$('go').disabled=false;
+  add(`Ready. ${chunks.length} passages indexed. Ask me anything.`);
+}
+$('file').onchange=e=>load(e.target.files);
+$('drop').ondragover=e=>{e.preventDefault();$('drop').classList.add('on')};
+$('drop').ondragleave=()=>$('drop').classList.remove('on');
+$('drop').ondrop=e=>{e.preventDefault();$('drop').classList.remove('on');load(e.dataTransfer.files)};
+$('form').onsubmit=async e=>{
+  e.preventDefault();const q=$('q').value.trim();if(!q)return;
+  $('q').value='';add(q,'me');
+  const hits=retrieve(q);
+  if(!hits.length){add('I could not find that in the uploaded documents. Try different keywords.');return;}
+  const wait=add('Thinking…');
+  try{
+    const ans=await generate(q,hits);
+    wait.remove();
+    add(ans,'',hits.map((h,i)=>`<div><span class="tag">${i+1}</span>${esc(h.c.doc)}, page ${h.c.page}: ${esc(h.c.text.slice(0,140))}…</div>`).join(''));
+  }catch(err){wait.textContent='Error: '+err.message+'. Check your API key or clear it to use offline mode.';}
+};
+try{$('key').value=localStorage.getItem('k')||'';$('key').onchange=()=>localStorage.setItem('k',$('key').value)}catch(e){}
+</script>
+</body>
+</html>
